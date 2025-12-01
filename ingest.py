@@ -9,6 +9,10 @@ from langchain_community.vectorstores import FAISS
 DATA_DIR = Path("data")
 PDF_FILES = sorted(DATA_DIR.glob("*.pdf"))
 
+# 더 세밀한 컨텍스트를 위한 chunk 설정 (기존 1000 -> 800)
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 160
+
 
 def extract_year_from_filename(path: Path):
     # sof21.pdf -> 2021, sof2025.pdf -> 2025 이런 식으로 처리
@@ -39,6 +43,29 @@ def detect_chapter(text: str, current_chapter: str | None):
     return current_chapter
 
 
+def detect_region(text: str, current_region: str | None):
+    """
+    간단한 룰 기반 region 태그 감지.
+    SoF에서 자주 등장하는 주요 지역/국가 중심으로 태깅.
+    """
+    lower = text.lower()
+
+    # 국가/지역 키워드 매핑
+    if "japan" in lower:
+        return "Japan"
+    if "india" in lower:
+        return "India"
+    if "united states" in lower or "u.s." in lower or " u.s " in lower or " us " in lower:
+        return "United States"
+    if "china" in lower:
+        return "China"
+    if "european union" in lower or "eu " in lower or " europe" in lower:
+        return "European Union"
+
+    # 명시적인 지역 키워드가 없는 경우 기존 값 유지, 없으면 Global
+    return current_region or "Global"
+
+
 def load_pdfs_with_metadata():
     docs = []
     for pdf_path in PDF_FILES:
@@ -49,11 +76,15 @@ def load_pdfs_with_metadata():
         pages = loader.load()
 
         current_chapter = None
+        current_region = "Global"
         for page_doc in pages:
-            # 챕터 감지 & 메타데이터 부여
+            # 챕터/리전 감지 & 메타데이터 부여
             current_chapter = detect_chapter(page_doc.page_content, current_chapter)
+            current_region = detect_region(page_doc.page_content, current_region)
+
             page_doc.metadata["year"] = year
             page_doc.metadata["chapter"] = current_chapter
+            page_doc.metadata["region"] = current_region
             docs.append(page_doc)
 
     return docs
@@ -61,8 +92,8 @@ def load_pdfs_with_metadata():
 
 def split_documents(docs):
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", " ", ""],
     )
     print("✂️ Splitting documents into chunks ...")

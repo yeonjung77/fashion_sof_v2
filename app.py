@@ -1,18 +1,20 @@
 import os
-import streamlit as st
-from dotenv import load_dotenv
 from collections import defaultdict
 
+import streamlit as st
+from dotenv import load_dotenv
+
+from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
 
 from search_timeline import (
+    generate_timeline_synthesis,
     search_keyword_timeline,
     summarize_yearly_insights,
-    generate_timeline_synthesis,
 )
 
 # ========================================
@@ -51,11 +53,95 @@ def load_llm():
     )
 
 
+@st.cache_resource
+def load_bm25_retriever(_vs: FAISS):
+    # 벡터스토어 안에 있는 전체 문서를 기반으로 BM25 인덱스 생성
+    all_docs = list(_vs.docstore._dict.values())
+    # k는 한 번에 반환할 최대 문서 수 (여유 있게 설정)
+    return BM25Retriever.from_documents(all_docs, k=50)
+
+
 vectorstore = load_vectorstore()
+bm25_retriever = load_bm25_retriever(vectorstore)
 llm = load_llm()
-retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+
+# 기본 retriever는 k를 조금 넉넉하게
+retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
 
 CHAPTER_LABELS = ["Global Economy", "Consumer Shifts", "Fashion System"]
+
+
+# ========================================
+# 하이브리드 검색 함수 (semantic + BM25)
+# ========================================
+def hybrid_search(
+    query: str,
+    semantic_k: int = 30,
+    keyword_k: int = 30,
+    combined_k: int = 12,
+    chapter_filter: str | None = None,
+    region_filter: str | None = None,
+):
+    """
+    - semantic: FAISS similarity_search
+    - keyword: BM25Retriever
+    두 결과의 rank를 점수로 변환해서 가중 평균 후 재정렬.
+    """
+    semantic_docs = vectorstore.similarity_search(query, k=semantic_k)
+    # 최신 BM25Retriever는 get_relevant_documents 대신 invoke 사용
+    keyword_docs = bm25_retriever.invoke(query)[:keyword_k]
+
+    def make_key(doc):
+        return (
+            doc.metadata.get("source"),
+            doc.metadata.get("page"),
+            doc.page_content,
+        )
+
+    scores = {}
+    n_sem = len(semantic_docs) or 1
+    n_kw = len(keyword_docs) or 1
+
+    # semantic rank 기반 점수 (높을수록 좋게)
+    for rank, doc in enumerate(semantic_docs):
+        key = make_key(doc)
+        sem_score = (n_sem - rank) / n_sem
+        prev_sem, prev_kw, prev_doc = scores.get(key, (0.0, 0.0, doc))
+        scores[key] = (max(prev_sem, sem_score), prev_kw, doc)
+
+    # BM25 rank 기반 점수
+    for rank, doc in enumerate(keyword_docs):
+        key = make_key(doc)
+        kw_score = (n_kw - rank) / n_kw
+        prev_sem, prev_kw, prev_doc = scores.get(key, (0.0, 0.0, doc))
+        scores[key] = (prev_sem, max(prev_kw, kw_score), doc)
+
+    # 가중 평균으로 최종 점수 생성
+    alpha = 0.6  # semantic 비중
+    scored_docs = []
+    for sem_score, kw_score, doc in scores.values():
+        final_score = alpha * sem_score + (1 - alpha) * kw_score
+
+        # 메타데이터 기반 필터링
+        if chapter_filter and doc.metadata.get("chapter") != chapter_filter:
+            continue
+        if region_filter and doc.metadata.get("region") != region_filter:
+            continue
+
+        scored_docs.append((final_score, doc))
+
+    # 필터링 후 결과가 너무 적으면 필터 없이 fallback
+    if not scored_docs:
+        scored_docs = [
+            (
+                alpha * ((n_sem - i) / n_sem),
+                d,
+            )
+            for i, d in enumerate(semantic_docs)
+        ]
+
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
+    return [d for _, d in scored_docs[:combined_k]]
 
 
 # ========================================
@@ -89,7 +175,11 @@ def format_docs(docs):
         page = d.metadata.get("page", "?")
         year = d.metadata.get("year", "")
         chapter = d.metadata.get("chapter", "")
-        header = f"[{year} / {chapter} / {src} p.{page}]"
+        region = d.metadata.get("region", "")
+        if region:
+            header = f"[{year} / {chapter} / {region} / {src} p.{page}]"
+        else:
+            header = f"[{year} / {chapter} / {src} p.{page}]"
         processed.append(header + "\n" + d.page_content)
     return "\n\n".join(processed)
 
@@ -117,6 +207,40 @@ qa_chain = qa_prompt | llm | StrOutputParser()
 
 
 # ========================================
+# 대화 로그 기반 리포트 생성용 프롬프트
+# ========================================
+report_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a senior fashion strategy consultant.\n"
+            "Below is a conversation between a Fashion MD and an AI research assistant\n"
+            "about insights from McKinsey & BoF 'State of Fashion' (2021–2025).\n"
+            "Use ONLY information that can be reasonably grounded in this conversation.\n"
+            "답변은 한국어로 작성하고, 핵심 개념은 필요할 때만 영어 병기해줘.",
+        ),
+        (
+            "human",
+            "다음은 사용자(패션 MD)와 AI 리서치 어시스턴트의 대화 로그입니다.\n"
+            "이 대화를 바탕으로 간결한 인사이트 리포트를 작성해주세요.\n\n"
+            "대화 로그:\n{conversation}\n\n"
+            "📌 리포트 구성은 다음 섹션을 포함해 주세요.\n"
+            "1. Executive Summary\n"
+            "2. Key Insights (bullet 형태)\n"
+            "3. Implications & Action Ideas (현업 활용 아이디어 중심)\n\n"
+            "⚠️ 주의사항\n"
+            "- 반드시 대화 내용에서 파생될 수 있는 인사이트만 정리할 것\n"
+            "- McKinsey/BoF 리포트에 일반적으로 등장할 법한 문장이라도, 대화에 전혀 나오지 않았다면 생성하지 말 것\n"
+            "- 한국어 문장을 사용하되, 필요한 핵심 용어만 영어 병기\n"
+            "- 문장은 짧고 명료하게, 실제 보고서에 바로 붙여 넣을 수 있는 톤으로 작성",
+        ),
+    ]
+)
+
+report_chain = report_prompt | llm | StrOutputParser()
+
+
+# ========================================
 # Streamlit UI 시작
 # ========================================
 st.set_page_config(page_title="State of Fashion — AI Insight Engine")
@@ -130,11 +254,12 @@ st.markdown("---")
 # ========================================
 # 메인 탭 구성
 # ========================================
-tab_main, tab_keyword, tab_chapter,tab_country = st.tabs([
+tab_main, tab_keyword, tab_chapter, tab_country, tab_chat = st.tabs([
     "1️⃣ AI Report Search",
     "2️⃣ Keyword Analytics",
     "3️⃣ Chapter Insighs",
     "4️⃣ Regional Insights",
+    "5️⃣ Strategy Chat & Report",
 ])
 
 
@@ -154,19 +279,46 @@ with tab_main:
             st.warning("질문을 입력해주세요.")
         else:
             with st.spinner("보고서를 분석하고 있습니다..."):
-                docs = vectorstore.similarity_search(question, k=25)
+                ch = None if chapter_filter == "전체" else chapter_filter
 
-                if chapter_filter != "전체":
-                    docs = [
-                        d for d in docs if d.metadata.get("chapter") == chapter_filter
-                    ]
-                    docs = docs[:8] or docs
+                # 하이브리드 검색으로 문서 검색
+                docs = hybrid_search(
+                    question,
+                    semantic_k=30,
+                    keyword_k=30,
+                    combined_k=12,
+                    chapter_filter=ch,
+                )
 
+                # LLM 컨텍스트는 상위 8개 정도만 사용
                 context = format_docs(docs[:8])
                 answer = qa_chain.invoke({"question": question, "context": context})
 
             st.markdown("### 📌 답변")
             st.write(answer)
+
+            # -----------------------
+            # RAG Validation Snippets
+            # -----------------------
+            st.markdown("### 🔍 참고 문장 (Top 3)")
+            if not docs:
+                st.info("참고할 문서를 찾지 못했습니다.")
+            else:
+                for i, d in enumerate(docs[:3], start=1):
+                    src = os.path.basename(d.metadata.get("source", ""))
+                    page = d.metadata.get("page", "?")
+                    year = d.metadata.get("year", "")
+                    chapter = d.metadata.get("chapter", "")
+                    region = d.metadata.get("region", "")
+
+                    meta_line = f"{year} / {chapter}"
+                    if region:
+                        meta_line += f" / {region}"
+                    meta_line += f" / {src} p.{page}"
+
+                    st.markdown(f"**[{i}] {meta_line}**")
+                    st.write(d.page_content)
+                    st.markdown("---")
 
 
 # ============================================================================
@@ -430,7 +582,14 @@ with tab_country:
             # 1) RAG 검색: 국가 관련 문서 필터링
             query = f"{country_text} market consumer trend economy fashion"
 
-            docs = vectorstore.similarity_search(query, k=25)
+            # region 메타데이터를 활용한 하이브리드 검색
+            docs = hybrid_search(
+                query,
+                semantic_k=30,
+                keyword_k=30,
+                combined_k=25,
+                region_filter=country_text,
+            )
 
             # 연도별 분리
             docs_2025 = [d.page_content for d in docs if d.metadata.get("year") == 2025]
@@ -629,3 +788,87 @@ with tab_keyword:
         fig_line.update_xaxes(type="category")
         st.plotly_chart(fig_line, use_container_width=True)
         st.markdown("---")
+
+
+# =====================================================================
+# 📌 TAB 5 — 대화형 챗봇 & 리포트 생성
+# =====================================================================
+with tab_chat:
+    st.subheader("Conversational Strategy Copilot")
+    st.caption("챗봇과 자유롭게 대화한 뒤, 대화 내용을 리포트로 정리할 수 있습니다.")
+
+    # 세션 상태 초기화
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "chat_report" not in st.session_state:
+        st.session_state.chat_report = ""
+
+    # 이전 메시지 출력
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # 사용자 입력
+    user_input = st.chat_input("패션·리테일 인사이트에 대해 자유롭게 질문해보세요.")
+
+    if user_input:
+        # 사용자 메시지 추가 및 표시
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # RAG 기반 답변 생성
+        with st.chat_message("assistant"):
+            with st.spinner("AI가 SoF 리포트를 참고해 답변 중입니다..."):
+                docs = hybrid_search(
+                    user_input,
+                    semantic_k=30,
+                    keyword_k=30,
+                    combined_k=12,
+                )
+                context = format_docs(docs[:8])
+                answer = qa_chain.invoke(
+                    {"question": user_input, "context": context}
+                )
+                st.markdown(answer)
+
+        # 어시스턴트 메시지를 히스토리에 저장
+        st.session_state.chat_history.append(
+            {"role": "assistant", "content": answer}
+        )
+
+    st.markdown("---")
+    st.markdown("### 📝 대화 내용을 리포트로 정리하기")
+
+    col_report_btn, col_clear = st.columns([2, 1])
+
+    with col_report_btn:
+        generate_report = st.button("대화 내용으로 리포트 생성")
+    with col_clear:
+        clear_chat = st.button("대화 및 리포트 초기화")
+
+    if clear_chat:
+        st.session_state.chat_history = []
+        st.session_state.chat_report = ""
+        st.experimental_rerun()
+
+    if generate_report:
+        if not st.session_state.chat_history:
+            st.warning("먼저 챗봇과 몇 번 대화를 나눈 뒤 리포트를 생성해주세요.")
+        else:
+            # 대화 로그를 하나의 텍스트로 병합
+            lines = []
+            for msg in st.session_state.chat_history:
+                role_label = "사용자" if msg["role"] == "user" else "AI"
+                lines.append(f"{role_label}: {msg['content']}")
+
+            conversation_text = "\n".join(lines)
+
+            with st.spinner("대화 내용을 요약 리포트로 정리하는 중입니다..."):
+                report = report_chain.invoke({"conversation": conversation_text})
+
+            st.session_state.chat_report = report
+
+    if st.session_state.chat_report:
+        st.markdown("### 📄 Generated Conversation Report")
+        st.write(st.session_state.chat_report)
