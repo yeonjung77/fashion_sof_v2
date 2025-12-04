@@ -19,7 +19,7 @@ PDF를 벡터화하여 Streamlit UI에서 실사용 가능한 형태로 제공�
 - 문서 처리: PyPDFLoader + RecursiveCharacterTextSplitter  
 - UI/배포: Streamlit, GitHub 
 
-##### 파이프라인
+##### Pipeline
 1. SoF 2021–2025 PDF 로드 및 연도·챕터 메타데이터 부착  
 2. Chunking → 임베딩 생성 → FAISS 벡터스토어 구축  
 3. 질문 입력 시 관련 chunk 검색 후 LLM이 근거 기반 답변 생성  
